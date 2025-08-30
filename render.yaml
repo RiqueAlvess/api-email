@@ -6,16 +6,12 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     
-    # Variáveis de ambiente
     envVars:
       - key: NODE_ENV
         value: production
-      - key: LOG_LEVEL
-        value: info
       - key: HEADLESS
         value: "true"
       - key: PORT
         sync: false
     
-    # Health check
     healthCheckPath: /ping

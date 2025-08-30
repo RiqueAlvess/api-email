@@ -1,36 +1,44 @@
 FROM node:18-slim
 
-# Instalar dependências do sistema para Firefox
+# Instalar dependências do sistema
 RUN apt-get update && apt-get install -y \
+    curl \
     wget \
-    gnupg \
     ca-certificates \
-    libnss3 \
+    fonts-liberation \
+    libasound2 \
     libatk-bridge2.0-0 \
     libdrm2 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
     libxcomposite1 \
     libxdamage1 \
     libxrandr2 \
+    xvfb \
     libgbm1 \
     libxss1 \
-    libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copiar package.json e instalar dependências Node
+# Copiar package files
 COPY package*.json ./
-RUN npm install --only=production
 
-# Instalar Firefox para Playwright
+# Instalar dependências
+RUN npm ci --only=production
+
+# Instalar Firefox
 RUN npx playwright install firefox
 RUN npx playwright install-deps firefox
 
-# Copiar código da aplicação
+# Copiar código
 COPY . .
 
-# Expor porta
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/ping || exit 1
+
 EXPOSE 3000
 
-# Iniciar aplicação
 CMD ["npm", "start"]

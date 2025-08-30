@@ -1,21 +1,32 @@
 {
     "name": "outlook-email-api",
-    "version": "1.0.0",
-    "description": "API para envio de emails via Outlook",
+    "version": "2.0.0",
+    "description": "API para envio de emails via Outlook otimizada para Render",
     "main": "index.js",
     "type": "module",
     "scripts": {
         "start": "node index.js",
         "build": "npx playwright install --with-deps firefox",
-        "dev": "node index.js"
+        "dev": "NODE_ENV=development node index.js",
+        "test": "echo \"Error: no test specified\" && exit 1"
     },
     "dependencies": {
         "express": "^4.18.2",
         "playwright": "^1.40.0",
         "pino": "^8.17.0",
+        "pino-pretty": "^10.3.1",
         "zod": "^3.22.4"
     },
     "engines": {
         "node": ">=18.0.0"
-    }
+    },
+    "keywords": [
+        "outlook",
+        "email",
+        "api",
+        "playwright",
+        "automation"
+    ],
+    "author": "Seu Nome",
+    "license": "MIT"
 }

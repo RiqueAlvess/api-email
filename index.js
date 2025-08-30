@@ -1,5 +1,5 @@
 import express from "express";
-import { firefox } from "playwright";
+import { chromium } from "playwright";
 import pino from "pino";
 import { z } from "zod";
 
@@ -29,7 +29,7 @@ const CONFIG = {
     maxRetries: 3,
     retryDelay: 5000,
 
-    // Argumentos otimizados para Render
+    // Argumentos otimizados para Chromium no Render
     browserArgs: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -46,7 +46,12 @@ const CONFIG = {
         '--disable-features=TranslateUI',
         '--disable-ipc-flooding-protection',
         '--memory-pressure-off',
-        '--max_old_space_size=1024'
+        '--max_old_space_size=1024',
+        '--disable-extensions',
+        '--disable-plugins',
+        '--disable-default-apps',
+        '--no-default-browser-check',
+        '--disable-sync'
     ]
 };
 
@@ -101,7 +106,7 @@ const EmailSchema = z.object({
     priority: z.enum(['low', 'normal', 'high']).default('normal')
 });
 
-// ==================== MAIN FUNCTION (RENDER OPTIMIZED) ====================
+// ==================== MAIN FUNCTION (CHROMIUM OPTIMIZED) ====================
 
 async function enviarEmail({ email, password, to, cc, subject, body, debug = false, priority = 'normal' }) {
     const logs = [];
@@ -120,13 +125,13 @@ async function enviarEmail({ email, password, to, cc, subject, body, debug = fal
     let pagina = null;
 
     try {
-        log("🚀 Iniciando navegador no Render...", 'info');
+        log("🚀 Iniciando navegador Chromium no Render...", 'info');
         log(`Platform: ${process.platform}, Node: ${process.version}`, 'info');
         logMemoryUsage("Início");
 
-        // Configuração otimizada para Render com retry
+        // Configuração otimizada para Chromium no Render
         navegador = await retryOperation(async () => {
-            return await firefox.launch({
+            return await chromium.launch({
                 headless: process.env.HEADLESS !== 'false',
                 args: CONFIG.browserArgs,
                 timeout: CONFIG.timeoutMs,
@@ -135,7 +140,7 @@ async function enviarEmail({ email, password, to, cc, subject, body, debug = fal
         });
 
         contexto = await navegador.newContext({
-            userAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0",
+            userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport: { width: 1366, height: 768 },
             ignoreHTTPSErrors: true,
             permissions: [],
@@ -526,7 +531,8 @@ async function enviarEmail({ email, password, to, cc, subject, body, debug = fal
             sentAt: new Date().toISOString(),
             processingTimeMs: processingTime,
             logs: debug ? logs : undefined,
-            memoryUsage: process.memoryUsage()
+            memoryUsage: process.memoryUsage(),
+            browser: 'chromium'
         };
 
     } catch (error) {
@@ -578,8 +584,9 @@ async function enviarEmail({ email, password, to, cc, subject, body, debug = fal
 app.get("/", (req, res) => {
     res.json({
         service: "outlook-email-api",
-        version: "2.0.0",
+        version: "2.1.0",
         status: "online",
+        browser: "chromium",
         platform: process.platform,
         node: process.version,
         environment: process.env.NODE_ENV || "development",
@@ -600,6 +607,7 @@ app.get("/health", (req, res) => {
     const usage = process.memoryUsage();
     res.json({
         status: "healthy",
+        browser: "chromium",
         timestamp: new Date().toISOString(),
         uptime: Math.round(process.uptime()),
         memory: {
@@ -640,6 +648,7 @@ app.post("/send-email", async (req, res) => {
             subject,
             priority,
             platform: process.platform,
+            browser: 'chromium',
             memory: process.memoryUsage()
         }, "Iniciando envio de email");
 
@@ -657,7 +666,7 @@ app.post("/send-email", async (req, res) => {
         const processingTime = Date.now() - startTime;
         const response = {
             status: "sucesso",
-            message: "Email enviado com sucesso!",
+            message: "Email enviado com sucesso via Chromium!",
             requestId,
             data: {
                 ...result,
@@ -670,6 +679,7 @@ app.post("/send-email", async (req, res) => {
             to,
             subject,
             processingTime,
+            browser: 'chromium',
             memoryUsage: result.memoryUsage
         }, "Email enviado com sucesso");
 
@@ -683,6 +693,7 @@ app.post("/send-email", async (req, res) => {
             error: error.message,
             stack: error.stack,
             processingTime,
+            browser: 'chromium',
             memory: process.memoryUsage()
         }, "Erro no envio");
 
@@ -690,6 +701,7 @@ app.post("/send-email", async (req, res) => {
             error: "falha_envio",
             message: error.message,
             requestId,
+            browser: "chromium",
             processingTimeMs: processingTime,
             platform: process.platform,
             timestamp: new Date().toISOString()
@@ -701,6 +713,7 @@ app.post("/send-email", async (req, res) => {
 app.get("/ping", (req, res) => {
     res.status(200).json({ 
         status: "pong", 
+        browser: "chromium",
         timestamp: new Date().toISOString(),
         uptime: Math.round(process.uptime())
     });
@@ -711,6 +724,7 @@ app.get("/metrics", (req, res) => {
     const usage = process.memoryUsage();
     res.json({
         timestamp: new Date().toISOString(),
+        browser: "chromium",
         uptime: process.uptime(),
         memory: {
             heapUsed: usage.heapUsed,
@@ -732,6 +746,7 @@ app.use((req, res) => {
     res.status(404).json({
         error: "endpoint_nao_encontrado",
         message: `Endpoint ${req.method} ${req.path} não encontrado`,
+        browser: "chromium",
         timestamp: new Date().toISOString()
     });
 });
@@ -748,6 +763,7 @@ app.use((error, req, res, next) => {
     res.status(500).json({
         error: "erro_interno",
         message: "Erro interno do servidor",
+        browser: "chromium",
         timestamp: new Date().toISOString()
     });
 });
@@ -760,14 +776,16 @@ const server = app.listen(CONFIG.port, '0.0.0.0', () => {
         platform: process.platform,
         node: process.version,
         env: process.env.NODE_ENV,
+        browser: 'chromium',
         memory: process.memoryUsage()
-    }, "🚀 API Outlook otimizada para Render!");
+    }, "🚀 API Outlook com Chromium rodando no Render!");
 
     console.log(`🚀 Servidor rodando na porta ${CONFIG.port}`);
     console.log(`📡 Health check: http://localhost:${CONFIG.port}/health`);
     console.log(`📧 Enviar email: POST http://localhost:${CONFIG.port}/send-email`);
     console.log(`🏥 Ping: http://localhost:${CONFIG.port}/ping`);
     console.log(`📊 Métricas: http://localhost:${CONFIG.port}/metrics`);
+    console.log(`🌐 Browser: Chromium (otimizado para Render)`);
 });
 
 // Graceful shutdown otimizado para Render

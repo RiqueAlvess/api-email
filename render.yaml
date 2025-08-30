@@ -1,14 +1,47 @@
 services:
   - type: web
     name: outlook-email-api
-    runtime: node
-    plan: starter
-    buildCommand: npm install && npx playwright install --with-deps firefox
-    startCommand: npm start
+    runtime: docker
+    plan: starter  # Mude para 'hobby' se precisar de mais recursos
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    
+    # Configurações de deploy
+    buildFilter:
+      paths:
+        - Dockerfile
+        - package*.json
+        - index.js
+        - "**/*.js"
+    
+    # Variáveis de ambiente
     envVars:
       - key: NODE_ENV
         value: production
-      - key: HEADLESS
-        value: true
       - key: LOG_LEVEL
         value: info
+      - key: HEADLESS
+        value: "true"
+      - key: PORT
+        sync: false
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /ms-playwright
+      - key: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+        value: "false"
+    
+    # Configurações de saúde
+    healthCheckPath: /health
+    
+    # Configurações de recursos (importante para navegadores)
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+    
+    # Headers de segurança
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff

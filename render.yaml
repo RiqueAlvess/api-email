@@ -1,17 +1,48 @@
 services:
   - type: web
     name: outlook-email-api
-    runtime: docker
+    runtime: node
     plan: starter
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    region: oregon
     
+    # Build simplificado - FOCO no Playwright Chromium
+    buildCommand: |
+      npm ci --only=production &&
+      npx playwright install --with-deps chromium
+    
+    # Comando de inicialização
+    startCommand: npm start
+    
+    # Node.js 18+ (compatível)
+    node:
+      version: "18"
+    
+    # Variáveis essenciais
     envVars:
       - key: NODE_ENV
         value: production
+      - key: LOG_LEVEL
+        value: info
       - key: HEADLESS
         value: "true"
       - key: PORT
         sync: false
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/.cache/ms-playwright
+      - key: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+        value: "false"
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=1024"
     
+    # Health check
     healthCheckPath: /ping
+    
+    # Cache de build para acelerar
+    buildFilter:
+      paths:
+        - package*.json
+        - index.js
+        - "**/*.js"
+      ignoredPaths:
+        - "**/*.md"
+        - ".git/**"

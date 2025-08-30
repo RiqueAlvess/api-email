@@ -5,16 +5,28 @@ import { z } from "zod";
 
 // ==================== CONFIGURATION FOR RENDER ====================
 
-const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+const logger = pino({ 
+    level: process.env.LOG_LEVEL || "info",
+    transport: {
+        target: 'pino-pretty',
+        options: {
+            colorize: false // Melhor para logs do Render
+        }
+    }
+});
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 const CONFIG = {
     outlookUrl: "https://outlook.office365.com/",
-    timeoutMs: 120000, // 2 minutos para servidores do Render
-    port: process.env.PORT || 3000, // Render define PORT automaticamente
+    timeoutMs: process.env.NODE_ENV === 'production' ? 300000 : 120000, // 5min em produção
+    navigationTimeout: 180000, // 3min para navegação
+    port: process.env.PORT || 3000,
+    maxRetries: 3,
+    retryDelay: 5000,
 
-    // Argumentos específicos para containers/Render
+    // Argumentos otimizados para Render
     browserArgs: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -23,9 +35,55 @@ const CONFIG = {
         '--no-first-run',
         '--no-zygote',
         '--disable-gpu',
-        '--disable-features=VizDisplayCompositor'
+        '--disable-features=VizDisplayCompositor',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-web-security',
+        '--disable-features=TranslateUI',
+        '--disable-ipc-flooding-protection',
+        '--memory-pressure-off',
+        '--max_old_space_size=1024'
     ]
 };
+
+// ==================== UTILITIES ====================
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function retryOperation(operation, maxRetries = CONFIG.maxRetries, delayMs = CONFIG.retryDelay) {
+    let lastError;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await operation();
+        } catch (error) {
+            lastError = error;
+            logger.warn(`Tentativa ${attempt}/${maxRetries} falhou: ${error.message}`);
+            
+            if (attempt < maxRetries) {
+                logger.info(`Aguardando ${delayMs}ms antes da próxima tentativa...`);
+                await delay(delayMs);
+                delayMs *= 1.5; // Backoff exponencial
+            }
+        }
+    }
+    
+    throw lastError;
+}
+
+function logMemoryUsage(context = "") {
+    const usage = process.memoryUsage();
+    logger.info({
+        context,
+        heapUsed: Math.round(usage.heapUsed / 1024 / 1024) + 'MB',
+        heapTotal: Math.round(usage.heapTotal / 1024 / 1024) + 'MB',
+        external: Math.round(usage.external / 1024 / 1024) + 'MB',
+        rss: Math.round(usage.rss / 1024 / 1024) + 'MB'
+    }, "Uso de memória");
+}
 
 // ==================== SCHEMA ====================
 
@@ -36,287 +94,396 @@ const EmailSchema = z.object({
     cc: z.union([z.string().email(), z.array(z.string().email())]).transform(val => Array.isArray(val) ? val : [val]).optional(),
     subject: z.string().min(1),
     body: z.string().default(""),
-    debug: z.boolean().default(false)
+    debug: z.boolean().default(false),
+    priority: z.enum(['low', 'normal', 'high']).default('normal')
 });
 
-// ==================== FUNÇÃO PRINCIPAL (OTIMIZADA PARA RENDER) ====================
+// ==================== MAIN FUNCTION (RENDER OPTIMIZED) ====================
 
-async function enviarEmail({ email, password, to, cc, subject, body, debug = false }) {
+async function enviarEmail({ email, password, to, cc, subject, body, debug = false, priority = 'normal' }) {
     const logs = [];
+    const startTime = Date.now();
 
-    function log(message) {
-        console.log(message);
-        if (debug) logs.push(message);
-        logger.info(message);
+    function log(message, level = 'info') {
+        const timestamp = new Date().toISOString();
+        const logMessage = `[${timestamp}] ${message}`;
+        console.log(logMessage);
+        if (debug) logs.push(logMessage);
+        logger[level](message);
     }
 
     let navegador = null;
+    let contexto = null;
+    let pagina = null;
 
     try {
-        log("🚀 Iniciando navegador no Render...");
-        log(`Platform: ${process.platform}, Node: ${process.version}`);
+        log("🚀 Iniciando navegador no Render...", 'info');
+        log(`Platform: ${process.platform}, Node: ${process.version}`, 'info');
+        logMemoryUsage("Início");
 
-        // Configuração otimizada para Render
-        navegador = await firefox.launch({
-            headless: true, // SEMPRE true no Render
-            args: CONFIG.browserArgs,
-            timeout: CONFIG.timeoutMs
+        // Configuração otimizada para Render com retry
+        navegador = await retryOperation(async () => {
+            return await firefox.launch({
+                headless: process.env.HEADLESS !== 'false',
+                args: CONFIG.browserArgs,
+                timeout: CONFIG.timeoutMs,
+                slowMo: process.env.NODE_ENV === 'production' ? 100 : 0 // Slow motion em produção
+            });
         });
 
-        const contexto = await navegador.newContext({
+        contexto = await navegador.newContext({
+            userAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0",
+            viewport: { width: 1366, height: 768 },
+            ignoreHTTPSErrors: true,
+            permissions: [],
             // Configurações para economizar recursos
-            userAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:91.0) Gecko/20100101 Firefox/91.0"
+            reducedMotion: 'reduce',
+            forcedColors: 'none',
+            colorScheme: 'light'
         });
 
-        const pagina = await contexto.newPage();
+        pagina = await contexto.newPage();
 
-        // Timeouts maiores para servidores
+        // Timeouts específicos para Render
         pagina.setDefaultTimeout(CONFIG.timeoutMs);
-        pagina.setDefaultNavigationTimeout(CONFIG.timeoutMs);
+        pagina.setDefaultNavigationTimeout(CONFIG.navigationTimeout);
 
-        // Bloquear recursos desnecessários para economizar banda
-        await pagina.route('**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2}', route => route.abort());
+        // Bloquear recursos desnecessários mais agressivamente
+        await pagina.route('**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,mp4,mp3,pdf}', route => route.abort());
+        await pagina.route('**/analytics/**', route => route.abort());
+        await pagina.route('**/tracking/**', route => route.abort());
+        await pagina.route('**/ads/**', route => route.abort());
 
-        log("🔐 Fazendo login no Outlook...");
-
-        // LOGIN com timeouts maiores
-        await pagina.goto(CONFIG.outlookUrl, {
-            waitUntil: 'domcontentloaded',
-            timeout: CONFIG.timeoutMs
+        // Interceptar erros de console
+        pagina.on('console', msg => {
+            if (msg.type() === 'error') {
+                log(`Console Error: ${msg.text()}`, 'warn');
+            }
         });
 
-        await pagina.waitForSelector("#i0116", { timeout: 60000 });
-        await pagina.locator("#i0116").fill(email);
-        await pagina.locator("#idSIButton9").click();
+        log("🔐 Fazendo login no Outlook...", 'info');
+        logMemoryUsage("Antes do login");
 
-        await pagina.waitForSelector("#i0118", { timeout: 60000 });
-        await pagina.locator("#i0118").fill(password);
-        await pagina.locator("#idSIButton9").click();
+        // LOGIN com retry automático
+        await retryOperation(async () => {
+            await pagina.goto(CONFIG.outlookUrl, {
+                waitUntil: 'domcontentloaded',
+                timeout: CONFIG.navigationTimeout
+            });
 
-        // Clica em "Sim" para manter logado
-        try {
-            await pagina.waitForSelector("#idSIButton9", { timeout: 10000 });
+            // Aguarda campo de email aparecer
+            await pagina.waitForSelector("#i0116", { timeout: 90000 });
+            await pagina.locator("#i0116").fill(email);
             await pagina.locator("#idSIButton9").click();
+
+            // Aguarda campo de senha
+            await pagina.waitForSelector("#i0118", { timeout: 90000 });
+            await pagina.locator("#i0118").fill(password);
+            await pagina.locator("#idSIButton9").click();
+        });
+
+        // Lida com "Manter conectado" com timeout
+        try {
+            await pagina.waitForSelector("#idSIButton9", { timeout: 15000 });
+            await pagina.locator("#idSIButton9").click();
+            log("Selecionou 'Manter conectado'", 'info');
         } catch {
-            log("Prompt 'manter logado' não apareceu");
+            log("Prompt 'manter conectado' não apareceu ou timeout", 'info');
         }
 
-        // Aguarda carregar completamente com timeout maior
-        await pagina.waitForLoadState('networkidle', { timeout: CONFIG.timeoutMs });
-        await pagina.waitForTimeout(5000);
+        // Aguarda carregamento completo com mais tolerância
+        try {
+            await pagina.waitForLoadState('networkidle', { timeout: 60000 });
+        } catch {
+            log("Timeout em networkidle, continuando...", 'warn');
+            await pagina.waitForLoadState('domcontentloaded');
+        }
 
-        log("✅ Login realizado com sucesso!");
-        log("📝 Procurando botão 'Novo email'...");
+        await delay(8000); // Delay maior para Render
+        log("✅ Login realizado com sucesso!", 'info');
+        logMemoryUsage("Após login");
 
-        // SELETORES (mesmo do código original)
+        // PROCURA E CLICA NO BOTÃO NOVO EMAIL
+        log("📝 Procurando botão 'Novo email'...", 'info');
+
         const seletoresNovoEmail = [
             'button.splitPrimaryButton[aria-label="Novo email"]',
+            'button.splitPrimaryButton[aria-label*="Novo"]',
             '[data-automation-type="RibbonSplitButton"][aria-label="Novo email"] button.splitPrimaryButton',
-            '.splitButtonContainer-219 button.splitPrimaryButton',
-            'button.splitPrimaryButton.root-193',
+            '[data-automation-type="RibbonSplitButton"][aria-label*="Novo"] button.splitPrimaryButton',
+            '.splitButtonContainer button.splitPrimaryButton',
             '[data-automationid="splitbuttonprimary"]',
             'button:has-text("Novo email")',
-            '[aria-label="Novo email"]'
+            'button:has-text("Novo")',
+            '[aria-label="Novo email"]',
+            '[aria-label*="Novo"]'
         ];
 
         let botaoClicado = false;
 
-        // Tenta cada seletor
+        // Tenta cada seletor com mais paciência
         for (const seletor of seletoresNovoEmail) {
+            if (botaoClicado) break;
+
             try {
-                log(`🔍 Tentando seletor: ${seletor}`);
+                log(`🔍 Tentando seletor: ${seletor}`, 'info');
+                await pagina.waitForTimeout(2000);
+                
                 const botoes = pagina.locator(seletor);
                 const quantidade = await botoes.count();
-                log(`Encontrados: ${quantidade} elementos`);
+                log(`Encontrados: ${quantidade} elementos`, 'info');
 
                 if (quantidade > 0) {
-                    const indiceMax = seletor.includes('data-automationid') ? 1 : Math.min(quantidade, 3);
+                    const indiceMax = Math.min(quantidade, 5);
 
                     for (let i = 0; i < indiceMax; i++) {
                         try {
                             const botao = botoes.nth(i);
 
+                            // Verifica se é o botão primário correto
                             const isButtonPrimary = await botao.evaluate((el) => {
-                                return !el.getAttribute('aria-haspopup') ||
-                                    el.classList.contains('splitPrimaryButton') ||
-                                    el.textContent.includes('Novo email');
+                                const hasNewEmailText = el.textContent && (
+                                    el.textContent.includes('Novo email') || 
+                                    el.textContent.includes('Novo') ||
+                                    el.getAttribute('aria-label')?.includes('Novo')
+                                );
+                                const isPrimary = !el.getAttribute('aria-haspopup') || 
+                                                el.classList.contains('splitPrimaryButton');
+                                return hasNewEmailText && isPrimary;
                             });
 
-                            if (!isButtonPrimary && seletor.includes('data-automationid')) {
-                                log(`Elemento ${i + 1} é dropdown, pulando...`);
+                            if (!isButtonPrimary) {
+                                log(`Elemento ${i + 1} não é o botão principal, pulando...`, 'info');
                                 continue;
                             }
 
                             const isVisible = await botao.isVisible();
-                            log(`Botão ${i + 1} visível: ${isVisible}`);
+                            log(`Botão ${i + 1} visível: ${isVisible}`, 'info');
 
                             if (isVisible) {
                                 await botao.scrollIntoViewIfNeeded();
-                                await pagina.waitForTimeout(2000); // Mais tempo no Render
+                                await delay(3000); // Mais tempo no Render
                                 await botao.focus();
-                                await pagina.waitForTimeout(1000);
-                                await botao.click({ timeout: 15000, force: true });
+                                await delay(1500);
+                                
+                                // Click com retry
+                                await retryOperation(async () => {
+                                    await botao.click({ timeout: 20000, force: true });
+                                }, 3, 2000);
+                                
                                 botaoClicado = true;
-                                log(`✅ Clicou no botão usando: ${seletor} (elemento ${i + 1})`);
+                                log(`✅ Clicou no botão usando: ${seletor} (elemento ${i + 1})`, 'info');
                                 break;
                             }
                         } catch (error) {
-                            log(`⚠️ Erro no elemento ${i + 1}: ${error.message}`);
+                            log(`⚠️ Erro no elemento ${i + 1}: ${error.message}`, 'warn');
                             continue;
                         }
                     }
                 }
-                if (botaoClicado) break;
             } catch (error) {
-                log(`❌ Erro com seletor ${seletor}: ${error.message}`);
+                log(`❌ Erro com seletor ${seletor}: ${error.message}`, 'warn');
                 continue;
             }
         }
 
-        // JavaScript fallback
+        // JavaScript fallback aprimorado
         if (!botaoClicado) {
-            log("🔧 Tentativa JavaScript específica...");
+            log("🔧 Tentativa JavaScript específica...", 'info');
             botaoClicado = await pagina.evaluate(() => {
-                const botaoPrimario = document.querySelector('button.splitPrimaryButton[aria-label="Novo email"]');
-                if (botaoPrimario && botaoPrimario.offsetParent !== null) {
-                    botaoPrimario.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    botaoPrimario.focus();
-                    botaoPrimario.click();
-                    return true;
-                }
-
-                const botoes = document.querySelectorAll('button');
-                for (let botao of botoes) {
-                    if (botao.getAttribute('aria-label') === 'Novo email' && botao.classList.contains('splitPrimaryButton')) {
-                        botao.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        botao.focus();
-                        botao.click();
+                // Busca mais agressiva
+                const searchTerms = ['Novo email', 'Novo', 'New mail', 'Compose'];
+                
+                for (const term of searchTerms) {
+                    // Busca por aria-label
+                    const botaoPorLabel = document.querySelector(`button[aria-label*="${term}"]`);
+                    if (botaoPorLabel && botaoPorLabel.offsetParent !== null) {
+                        botaoPorLabel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        botaoPorLabel.focus();
+                        botaoPorLabel.click();
                         return true;
                     }
-                }
 
-                const container = document.querySelector('[data-automation-type="RibbonSplitButton"][aria-label="Novo email"]');
-                if (container) {
-                    const botaoInterno = container.querySelector('button.splitPrimaryButton');
-                    if (botaoInterno) {
-                        container.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        botaoInterno.focus();
-                        botaoInterno.click();
-                        return true;
+                    // Busca por texto
+                    const elementos = document.querySelectorAll('button, [role="button"]');
+                    for (let el of elementos) {
+                        if (el.textContent && el.textContent.includes(term) && 
+                            el.offsetParent !== null) {
+                            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            el.focus();
+                            el.click();
+                            return true;
+                        }
                     }
                 }
                 return false;
             });
 
             if (botaoClicado) {
-                log("✅ Clicou usando JavaScript específico!");
-                await pagina.waitForTimeout(5000);
+                log("✅ Clicou usando JavaScript específico!", 'info');
+                await delay(8000);
             }
         }
 
         if (!botaoClicado) {
-            throw new Error("❌ Não foi possível clicar no botão 'Novo email'");
+            throw new Error("❌ Não foi possível clicar no botão 'Novo email' após todas as tentativas");
         }
 
         // Aguarda janela de composição com timeout maior
-        await pagina.waitForSelector('[aria-label="Para"]', { timeout: 30000 });
-        log("✅ Janela de composição aberta!");
+        log("⏳ Aguardando janela de composição...", 'info');
+        await retryOperation(async () => {
+            await pagina.waitForSelector('[aria-label="Para"]', { timeout: 45000 });
+        });
+        
+        log("✅ Janela de composição aberta!", 'info');
+        logMemoryUsage("Janela de composição");
 
-        // PREENCHE OS CAMPOS com mais tempo entre ações
-        log("📧 Preenchendo destinatários...");
-        const campoPara = pagina.locator('[aria-label="Para"]');
+        // PREENCHE OS CAMPOS com delays maiores
+        log("📧 Preenchendo destinatários...", 'info');
+        const campoPara = pagina.locator('[aria-label="Para"]').first();
         await campoPara.click();
+        await delay(2000);
         await campoPara.fill(to.join("; "));
-        await pagina.waitForTimeout(2000);
+        await delay(3000);
 
         // CC se houver
         if (cc && cc.length > 0) {
-            log("📋 Preenchendo cópia...");
+            log("📋 Preenchendo cópia...", 'info');
             try {
-                const campoCc = pagina.locator('[aria-label="Cc"]');
+                // Tenta mostrar campo CC se não visível
+                const botaoCc = pagina.locator('[aria-label="Mostrar Cc"]').or(pagina.locator('button:has-text("Cc")'));
+                if (await botaoCc.count() > 0) {
+                    await botaoCc.first().click();
+                    await delay(2000);
+                }
+
+                const campoCc = pagina.locator('[aria-label="Cc"]').first();
                 await campoCc.click();
+                await delay(2000);
                 await campoCc.fill(cc.join("; "));
-                await pagina.waitForTimeout(2000);
+                await delay(3000);
             } catch (error) {
-                log("⚠️ Campo CC não encontrado ou não visível");
+                log(`⚠️ Erro ao preencher CC: ${error.message}`, 'warn');
             }
         }
 
         // ASSUNTO
-        log("📌 Preenchendo assunto...");
-        const campoAssunto = pagina.locator('[aria-label="Assunto"]');
+        log("📌 Preenchendo assunto...", 'info');
+        const campoAssunto = pagina.locator('[aria-label="Assunto"]').first();
         await campoAssunto.click();
+        await delay(2000);
         await campoAssunto.fill(subject);
-        await pagina.waitForTimeout(2000);
+        await delay(3000);
 
         // CORPO
         if (body) {
-            log("✍️ Preenchendo corpo da mensagem...");
-            const editorCorpo = pagina.locator('[aria-label="Corpo da mensagem"]');
-            await editorCorpo.click();
-            await pagina.waitForTimeout(2000);
-            await pagina.keyboard.press('Control+a');
+            log("✍️ Preenchendo corpo da mensagem...", 'info');
+            const seletoresCorpo = [
+                '[aria-label="Corpo da mensagem"]',
+                '[aria-label*="Corpo"]',
+                '[aria-label*="Message body"]',
+                '[role="textbox"][aria-multiline="true"]',
+                '.rps_1fb8 [role="textbox"]'
+            ];
 
-            if (body.includes('<')) {
-                await pagina.evaluate((html) => {
-                    const editor = document.querySelector('[aria-label="Corpo da mensagem"]');
-                    if (editor) {
-                        editor.innerHTML = html;
+            let corpoPreenchido = false;
+            for (const seletor of seletoresCorpo) {
+                try {
+                    const editor = pagina.locator(seletor).first();
+                    if (await editor.count() > 0) {
+                        await editor.click();
+                        await delay(3000);
+                        
+                        // Limpa conteúdo existente
+                        await pagina.keyboard.press('Control+a');
+                        await delay(1000);
+
+                        if (body.includes('<') && body.includes('>')) {
+                            // HTML content
+                            await pagina.evaluate((html, selector) => {
+                                const editor = document.querySelector(selector);
+                                if (editor) {
+                                    editor.innerHTML = html;
+                                }
+                            }, body, seletor);
+                        } else {
+                            // Texto simples
+                            await editor.fill(body);
+                        }
+                        
+                        await delay(3000);
+                        corpoPreenchido = true;
+                        break;
                     }
-                }, body);
-            } else {
-                await editorCorpo.fill(body);
+                } catch (error) {
+                    log(`Tentativa de preencher corpo com ${seletor} falhou: ${error.message}`, 'warn');
+                    continue;
+                }
             }
-            await pagina.waitForTimeout(2000);
+
+            if (!corpoPreenchido) {
+                log("⚠️ Não foi possível preencher o corpo da mensagem", 'warn');
+            }
         }
 
-        log("📤 Enviando email...");
+        log("📤 Enviando email...", 'info');
+        logMemoryUsage("Antes de enviar");
 
-        // ENVIA com timeouts maiores
+        // ENVIO com mais tentativas
         const seletoresEnviar = [
-            'span.fui-Button__icon:has-text("Enviar")',
-            'span:has(.fui-Button__icon):has-text("Enviar")',
+            'button[aria-label="Enviar"]',
             'button:has-text("Enviar")',
-            '[aria-label="Enviar"]',
             '[data-automation-id="Send"]',
-            '[title="Enviar"]'
+            '[title="Enviar"]',
+            'span:has-text("Enviar")',
+            'button[type="submit"]',
+            '.ms-Button--primary:has-text("Enviar")'
         ];
 
         let emailEnviado = false;
 
-        for (const seletor of seletoresEnviar) {
-            try {
-                const botaoEnviar = pagina.locator(seletor);
-                if (await botaoEnviar.count() > 0) {
-                    await botaoEnviar.first().click();
-                    emailEnviado = true;
-                    log(`✅ Email enviado usando seletor: ${seletor}`);
-                    break;
+        await retryOperation(async () => {
+            for (const seletor of seletoresEnviar) {
+                try {
+                    const botaoEnviar = pagina.locator(seletor);
+                    const count = await botaoEnviar.count();
+                    
+                    if (count > 0) {
+                        const botao = botaoEnviar.first();
+                        await botao.scrollIntoViewIfNeeded();
+                        await delay(2000);
+                        await botao.click();
+                        emailEnviado = true;
+                        log(`✅ Email enviado usando seletor: ${seletor}`, 'info');
+                        break;
+                    }
+                } catch (error) {
+                    continue;
                 }
-            } catch (error) {
-                continue;
             }
-        }
 
-        // JavaScript fallback para enviar
-        if (!emailEnviado) {
-            try {
-                log("🔧 Tentativa JavaScript para enviar...");
+            // JavaScript fallback para enviar
+            if (!emailEnviado) {
+                log("🔧 Tentativa JavaScript para enviar...", 'info');
                 const botaoEncontrado = await pagina.evaluate(() => {
-                    const spans = document.querySelectorAll('span.fui-Button__icon');
-                    for (let span of spans) {
-                        if (span.textContent && span.textContent.includes('Enviar')) {
-                            span.click();
+                    const searchTerms = ['Enviar', 'Send'];
+                    
+                    for (const term of searchTerms) {
+                        // Procura por aria-label
+                        const botaoPorLabel = document.querySelector(`button[aria-label*="${term}"]`);
+                        if (botaoPorLabel && botaoPorLabel.offsetParent !== null) {
+                            botaoPorLabel.click();
                             return true;
                         }
-                    }
 
-                    const todosElementos = document.querySelectorAll('*');
-                    for (let elemento of todosElementos) {
-                        if (elemento.textContent === 'Enviar' &&
-                            (elemento.tagName === 'BUTTON' || elemento.onclick || elemento.getAttribute('role') === 'button')) {
-                            elemento.click();
-                            return true;
+                        // Procura por texto
+                        const elementos = document.querySelectorAll('button, [role="button"]');
+                        for (let el of elementos) {
+                            if (el.textContent && el.textContent.trim() === term && 
+                                el.offsetParent !== null) {
+                                el.click();
+                                return true;
+                            }
                         }
                     }
                     return false;
@@ -324,27 +491,29 @@ async function enviarEmail({ email, password, to, cc, subject, body, debug = fal
 
                 if (botaoEncontrado) {
                     emailEnviado = true;
-                    log("✅ Email enviado usando busca JavaScript!");
+                    log("✅ Email enviado usando busca JavaScript!", 'info');
                 }
-            } catch (error) {
-                log(`⚠️ Erro na busca JavaScript: ${error.message}`);
             }
-        }
 
-        if (!emailEnviado) {
-            throw new Error("❌ Não foi possível encontrar o botão de enviar");
-        }
+            if (!emailEnviado) {
+                throw new Error("❌ Não foi possível encontrar o botão de enviar");
+            }
+        }, 3, 3000);
 
         // Aguarda confirmação com mais tempo
-        await pagina.waitForTimeout(8000);
-        log("✅ Email enviado com sucesso!");
+        await delay(12000);
+        log("✅ Email enviado com sucesso!", 'info');
+        logMemoryUsage("Email enviado");
 
-        log("📊 RESUMO DO ENVIO:");
-        log(`📧 Para: ${to.join(", ")}`);
-        if (cc) log(`📋 CC: ${cc.join(", ")}`);
-        log(`📌 Assunto: ${subject}`);
-        log(`📝 Corpo: ${body.length} caracteres`);
-        log(`⏰ Enviado em: ${new Date().toLocaleString('pt-BR')}`);
+        // RESUMO
+        const processingTime = Date.now() - startTime;
+        log("📊 RESUMO DO ENVIO:", 'info');
+        log(`📧 Para: ${to.join(", ")}`, 'info');
+        if (cc && cc.length > 0) log(`📋 CC: ${cc.join(", ")}`, 'info');
+        log(`📌 Assunto: ${subject}`, 'info');
+        log(`📝 Corpo: ${body.length} caracteres`, 'info');
+        log(`🕒 Tempo de processamento: ${Math.round(processingTime / 1000)}s`, 'info');
+        log(`⏰ Enviado em: ${new Date().toLocaleString('pt-BR')}`, 'info');
 
         return {
             success: true,
@@ -352,29 +521,52 @@ async function enviarEmail({ email, password, to, cc, subject, body, debug = fal
             cc,
             subject,
             sentAt: new Date().toISOString(),
-            logs: debug ? logs : undefined
+            processingTimeMs: processingTime,
+            logs: debug ? logs : undefined,
+            memoryUsage: process.memoryUsage()
         };
 
     } catch (error) {
-        log(`❌ Erro: ${error.message}`);
-        // Log mais detalhado para debug no Render
+        const processingTime = Date.now() - startTime;
+        log(`❌ Erro: ${error.message}`, 'error');
+        
+        // Log detalhado para debug
         logger.error({
             message: error.message,
             stack: error.stack,
             platform: process.platform,
             nodeVersion: process.version,
-            memory: process.memoryUsage()
-        }, "Erro detalhado");
-        throw error;
+            memory: process.memoryUsage(),
+            processingTime
+        }, "Erro detalhado no envio");
+
+        throw new Error(`Falha no envio do email: ${error.message}`);
     } finally {
-        if (navegador) {
-            try {
-                await navegador.close();
-                log("🔒 Navegador fechado");
-            } catch (closeError) {
-                log(`⚠️ Erro ao fechar navegador: ${closeError.message}`);
+        // Cleanup com mais cuidado
+        try {
+            if (pagina) {
+                await pagina.close();
+                log("📄 Página fechada", 'info');
             }
+            if (contexto) {
+                await contexto.close();
+                log("🔒 Contexto fechado", 'info');
+            }
+            if (navegador) {
+                await navegador.close();
+                log("🔒 Navegador fechado", 'info');
+            }
+        } catch (closeError) {
+            log(`⚠️ Erro ao fechar recursos: ${closeError.message}`, 'warn');
         }
+
+        // Force garbage collection se disponível
+        if (global.gc) {
+            global.gc();
+            log("🗑️ Garbage collection executado", 'info');
+        }
+
+        logMemoryUsage("Após cleanup");
     }
 }
 
@@ -383,30 +575,47 @@ async function enviarEmail({ email, password, to, cc, subject, body, debug = fal
 app.get("/", (req, res) => {
     res.json({
         service: "outlook-email-api",
-        version: "1.0.0",
+        version: "2.0.0",
         status: "online",
         platform: process.platform,
         node: process.version,
         environment: process.env.NODE_ENV || "development",
+        uptime: Math.round(process.uptime()),
+        memory: {
+            used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
+            total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024) + 'MB'
+        },
         endpoints: {
             health: "GET /health",
+            ping: "GET /ping",
             sendEmail: "POST /send-email"
         }
     });
 });
 
 app.get("/health", (req, res) => {
+    const usage = process.memoryUsage();
     res.json({
         status: "healthy",
         timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        memory: process.memoryUsage(),
-        platform: process.platform
+        uptime: Math.round(process.uptime()),
+        memory: {
+            heapUsed: Math.round(usage.heapUsed / 1024 / 1024) + 'MB',
+            heapTotal: Math.round(usage.heapTotal / 1024 / 1024) + 'MB',
+            external: Math.round(usage.external / 1024 / 1024) + 'MB',
+            rss: Math.round(usage.rss / 1024 / 1024) + 'MB'
+        },
+        platform: process.platform,
+        node: process.version,
+        env: process.env.NODE_ENV
     });
 });
 
 app.post("/send-email", async (req, res) => {
+    const requestId = Date.now().toString(36);
     const startTime = Date.now();
+
+    logger.info({ requestId, body: { ...req.body, password: '***' } }, "Nova requisição de email");
 
     try {
         const parseResult = EmailSchema.safeParse(req.body);
@@ -414,16 +623,19 @@ app.post("/send-email", async (req, res) => {
             return res.status(400).json({
                 error: "dados_invalidos",
                 message: "Dados da requisição inválidos",
-                details: parseResult.error.flatten()
+                details: parseResult.error.flatten(),
+                requestId
             });
         }
 
-        const { email, password, to, cc, subject, body, debug } = parseResult.data;
+        const { email, password, to, cc, subject, body, debug, priority } = parseResult.data;
 
         logger.info({
-            email,
+            requestId,
+            email: email.substring(0, 5) + '***',
             to,
             subject,
+            priority,
             platform: process.platform,
             memory: process.memoryUsage()
         }, "Iniciando envio de email");
@@ -435,45 +647,106 @@ app.post("/send-email", async (req, res) => {
             cc,
             subject,
             body,
-            debug
+            debug,
+            priority
         });
 
+        const processingTime = Date.now() - startTime;
         const response = {
             status: "sucesso",
             message: "Email enviado com sucesso!",
+            requestId,
             data: {
                 ...result,
-                processingTimeMs: Date.now() - startTime
+                processingTimeMs: processingTime
             }
         };
 
         logger.info({
+            requestId,
             to,
             subject,
-            processingTime: Date.now() - startTime
+            processingTime,
+            memoryUsage: result.memoryUsage
         }, "Email enviado com sucesso");
 
         res.json(response);
 
     } catch (error) {
+        const processingTime = Date.now() - startTime;
+        
         logger.error({
+            requestId,
             error: error.message,
-            processingTime: Date.now() - startTime,
+            stack: error.stack,
+            processingTime,
             memory: process.memoryUsage()
         }, "Erro no envio");
 
         res.status(500).json({
             error: "falha_envio",
             message: error.message,
-            processingTimeMs: Date.now() - startTime,
-            platform: process.platform
+            requestId,
+            processingTimeMs: processingTime,
+            platform: process.platform,
+            timestamp: new Date().toISOString()
         });
     }
 });
 
 // Health check específico para Render
 app.get("/ping", (req, res) => {
-    res.status(200).send("pong");
+    res.status(200).json({ 
+        status: "pong", 
+        timestamp: new Date().toISOString(),
+        uptime: Math.round(process.uptime())
+    });
+});
+
+// Endpoint de métricas
+app.get("/metrics", (req, res) => {
+    const usage = process.memoryUsage();
+    res.json({
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        memory: {
+            heapUsed: usage.heapUsed,
+            heapTotal: usage.heapTotal,
+            external: usage.external,
+            rss: usage.rss
+        },
+        cpu: process.cpuUsage(),
+        platform: process.platform,
+        arch: process.arch,
+        version: process.version
+    });
+});
+
+// ==================== ERROR HANDLERS ====================
+
+// 404 handler
+app.use((req, res) => {
+    res.status(404).json({
+        error: "endpoint_nao_encontrado",
+        message: `Endpoint ${req.method} ${req.path} não encontrado`,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Global error handler
+app.use((error, req, res, next) => {
+    logger.error({
+        error: error.message,
+        stack: error.stack,
+        url: req.url,
+        method: req.method
+    }, "Erro global");
+
+    res.status(500).json({
+        error: "erro_interno",
+        message: "Erro interno do servidor",
+        timestamp: new Date().toISOString()
+    });
 });
 
 // ==================== START SERVER ====================
@@ -483,30 +756,58 @@ const server = app.listen(CONFIG.port, '0.0.0.0', () => {
         port: CONFIG.port,
         platform: process.platform,
         node: process.version,
-        env: process.env.NODE_ENV
-    }, "🚀 API Outlook rodando no Render!");
+        env: process.env.NODE_ENV,
+        memory: process.memoryUsage()
+    }, "🚀 API Outlook otimizada para Render!");
 
     console.log(`🚀 Servidor rodando na porta ${CONFIG.port}`);
     console.log(`📡 Health check: http://localhost:${CONFIG.port}/health`);
     console.log(`📧 Enviar email: POST http://localhost:${CONFIG.port}/send-email`);
     console.log(`🏥 Ping: http://localhost:${CONFIG.port}/ping`);
+    console.log(`📊 Métricas: http://localhost:${CONFIG.port}/metrics`);
 });
 
-// Graceful shutdown para Render
-process.on("SIGTERM", () => {
-    logger.info("SIGTERM recebido, fechando servidor...");
-    server.close(() => {
-        logger.info("Servidor fechado graciosamente");
+// Graceful shutdown otimizado para Render
+function gracefulShutdown(signal) {
+    logger.info(`${signal} recebido, iniciando shutdown gracioso...`);
+    
+    server.close(async () => {
+        logger.info("Servidor HTTP fechado");
+        
+        // Force cleanup se necessário
+        if (global.gc) {
+            global.gc();
+            logger.info("Garbage collection executado no shutdown");
+        }
+        
+        logger.info("Shutdown gracioso completado");
         process.exit(0);
     });
+    
+    // Force exit após 30 segundos
+    setTimeout(() => {
+        logger.error("Timeout no shutdown, forçando saída");
+        process.exit(1);
+    }, 30000);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    logger.fatal({
+        error: error.message,
+        stack: error.stack
+    }, 'Uncaught Exception');
+    process.exit(1);
 });
 
-process.on("SIGINT", () => {
-    logger.info("SIGINT recebido, fechando servidor...");
-    server.close(() => {
-        logger.info("Servidor fechado graciosamente");
-        process.exit(0);
-    });
+process.on('unhandledRejection', (reason, promise) => {
+    logger.fatal({
+        reason,
+        promise
+    }, 'Unhandled Rejection');
 });
 
 export default app;
